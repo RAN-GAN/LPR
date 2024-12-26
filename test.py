@@ -3,47 +3,39 @@ import numpy as np
 import easyocr
 import os
 
-# Constants
 model_dir = "model"
 min_area = 500
 output_dir = "plates"
+count = 0
 
-# Initialize EasyOCR Reader
 reader = easyocr.Reader(['en'], gpu=False, model_storage_directory=model_dir)
 
-# Ensure output directory exists
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
 
-# Display and save intermediate images
-def save_and_show_image(stage, img):
-    filename = os.path.join(output_dir, f"{stage}.jpg")
+def save_and_show_image(stage, img, count=None):
+    if count is not None:
+        filename = os.path.join(output_dir, f"{stage}_{count}.jpg")
+    else:
+        filename = os.path.join(output_dir, f"{stage}.jpg")
     cv2.imwrite(filename, img)
     cv2.imshow(stage, img)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-# Preprocess image (enhanced for license plates)
 def preprocess_image(img):
-    # Convert to grayscale
     img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    save_and_show_image("Gray_Image", img_gray)
 
-    # Apply GaussianBlur to reduce noise
-    img_blur = cv2.GaussianBlur(img_gray, (5, 5), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    img_contrast = clahe.apply(img_gray)
+    save_and_show_image("Contrast_Enhanced", img_contrast)
 
-    # Use adaptive thresholding for better contrast in varying lighting conditions
-    img_thresh = cv2.adaptiveThreshold(
-        img_blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 2
-    )
+    _, img_threshold = cv2.threshold(img_contrast, 150, 255, cv2.THRESH_BINARY)
+    save_and_show_image("Thresholded_Image", img_threshold)
 
-    # Morphological operations to close gaps
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    img_morph = cv2.morphologyEx(img_thresh, cv2.MORPH_CLOSE, kernel)
+    return img_threshold
 
-    return img_morph
-
-# Correct perspective of a region
 def correct_perspective(image, box):
     rect = cv2.boundingRect(np.array(box, dtype="float32"))
     (x, y, w, h) = rect
@@ -56,72 +48,70 @@ def correct_perspective(image, box):
     warped = cv2.warpPerspective(image, M, (w, h))
     return warped
 
-# Perform OCR using EasyOCR
+def deskew_image(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, 200)
+
+    if lines is not None:
+        for rho, theta in lines[0]:
+            angle = np.rad2deg(theta) - 90
+            (h, w) = image.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1)
+            rotated = cv2.warpAffine(image, M, (w, h))
+            return rotated
+    return image
+
 def easyocr_ocr(image):
     results = reader.readtext(image)
+    print("Detected Texts:")
+    for result in results:
+        print(f"Detected Text: {result[1]} with confidence {result[2]:.2f}")
     return results
 
-# Detect plate using contours with better filtering
 def detect_plate_using_contours(image):
-    # gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(image, 100, 200)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 100, 200)
+    contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     plates = []
-
     for contour in contours:
-        area = cv2.contourArea(contour)
-        if area > min_area:
+        if cv2.contourArea(contour) > min_area:
             epsilon = 0.02 * cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, epsilon, True)
-            if len(approx) == 4:  # Likely a rectangle
-                x, y, w, h = cv2.boundingRect(approx)
-                aspect_ratio = w / h
-                if 2 < aspect_ratio < 5:  # Typical license plate dimensions
-                    plates.append(approx)
+            if len(approx) == 4: 
+                plates.append(approx)
     return plates
 
-# Process image and detect plates
 def process_image(image_path):
-    # Read the image
+    global count
+
     img = cv2.imread(image_path)
     if img is None:
         print("Error: Could not load image. Check the file path.")
         return
-
     save_and_show_image("Original_Image", img)
 
-    # Preprocess the image
-    preprocessed_img = preprocess_image(img)
-    save_and_show_image("Preprocessed_Image", preprocessed_img)
-
-    # Detect plates using contours
-    plates = detect_plate_using_contours(preprocessed_img)
-
-    best_confidence = 0
-    best_plate_text = None
-    best_plate_img = None
+    plates = detect_plate_using_contours(img)
 
     for plate in plates:
         warped = correct_perspective(img, plate)
-        warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-        _, plate_binary = cv2.threshold(warped_gray, 128, 255, cv2.THRESH_BINARY)
+        save_and_show_image(f"Warped_Plate_{count}", warped, count)
 
-        ocr_results = easyocr_ocr(plate_binary)
+        deskewed = deskew_image(warped)
+        save_and_show_image(f"Deskewed_Plate_{count}", deskewed, count)
 
-        for result in ocr_results:
-            text, confidence = result[1], result[2]
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_plate_text = text
-                best_plate_img = warped
+        preprocessed_img = preprocess_image(deskewed)
 
-    if best_plate_img is not None:
-        print(f"Best Plate Text: {best_plate_text} with confidence {best_confidence:.2f}")
-        save_and_show_image("Best_Plate", best_plate_img)
-    else:
-        print("No plates detected with sufficient confidence.")
+        plate_text = easyocr_ocr(preprocessed_img)
+        print(f"Detected Text for plate {count}: {plate_text}")
+        count += 1
+
+    output_image_path = os.path.join(output_dir, "output_with_detections.jpg")
+    cv2.imwrite(output_image_path, img)
+    save_and_show_image("Final_Output", img)
 
 if __name__ == "__main__":
-    image_path = "car4.jpg"  # Replace with your image file path
+    image_path = "car.jpg" 
     process_image(image_path)
